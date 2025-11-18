@@ -1,21 +1,19 @@
-//10.19.47.196
-
 use clap::Parser;
 use log::{error, info};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Streaming video from Raspberry Pi", long_about = None)]
+#[command(author, version, about = "Streaming video from Raspberry Pi (libcamera)", long_about = None)]
 struct Args {
-    /// Width of frame
+    /// Width of the frame
     #[arg(short, long, default_value_t = 640)]
     width: u32,
 
-    /// Height of frame
+    /// Height of the frame
     #[arg(short = 'H', long, default_value_t = 480)]
     height: u32,
 
@@ -23,30 +21,30 @@ struct Args {
     #[arg(short, long, default_value_t = 30)]
     fps: u32,
 
-    /// WebSocket (computer) server IP address
-    #[arg(short, long, default_value = "10.19.47.196")]
+    /// Computer server IP address (TCP)
+    #[arg(short, long, default_value = "10.0.0.1")]
     ip: String,
 
-    /// WebSocket (computer) server port
+    /// Server port
     #[arg(short, long, default_value_t = 2281)]
     port: u16,
 
-    /// Flip frame vertically (0 or 1)
+    /// Vertical flip (0 or 1)
     #[arg(short, long, default_value_t = 1)]
     vflip: u8,
 
-    /// Flip frame horizontally (0 or 1)
+    /// Horizontal flip (0 or 1)
     #[arg(long, default_value_t = 0)]
     hflip: u8,
 
-    /// Timeout for camera warmup in seconds
+    /// Timeout for reconnect/warmup
     #[arg(short, long, default_value_t = 1)]
     timeout: u64,
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
+        .format_timestamp_secs()
         .init();
 
     let args = Args::parse();
@@ -58,7 +56,7 @@ fn main() {
                 break;
             }
             Err(e) => {
-                error!("Error occurred: {}. Retrying in {}s...", e, args.timeout);
+                error!("Error: {} — retrying in {}s...", e, args.timeout);
                 thread::sleep(Duration::from_secs(args.timeout));
             }
         }
@@ -66,72 +64,69 @@ fn main() {
 }
 
 fn run_stream(args: &Args) -> io::Result<()> {
-    // Connect to server
+    // -----------------------------
+    // Connect to PC viewer
+    // -----------------------------
     let mut stream = TcpStream::connect(format!("{}:{}", args.ip, args.port))?;
-    info!("Connected to server successfully.");
-    info!("Starting broadcast to {}.", args.ip);
+    info!("Connected to viewer at {}:{}", args.ip, args.port);
 
-    // Build raspistill command for capturing JPEG frames
-    let vflip = if args.vflip == 1 { "-vf" } else { "" };
-    let hflip = if args.hflip == 1 { "-hf" } else { "" };
-    
-    let mut cmd = Command::new("raspistill");
-    cmd.arg("-w").arg(args.width.to_string())
-        .arg("-h").arg(args.height.to_string())
-        .arg("-fps").arg(args.fps.to_string())
-        .arg("-t").arg("0") // Run indefinitely
-        .arg("-o").arg("-") // Output to stdout
-        .arg("-n") // No preview
+    // -----------------------------
+    // Build libcamera-vid command
+    // -----------------------------
+    let mut cmd = Command::new("libcamera-vid");
+
+    cmd.arg("--codec").arg("mjpeg")
+        .arg("--timeout").arg("0") // run forever
+        .arg("--framerate").arg(args.fps.to_string())
+        .arg("--width").arg(args.width.to_string())
+        .arg("--height").arg(args.height.to_string())
+        .arg("-o").arg("-")        // output to stdout
         .stdout(Stdio::piped());
-    
-    if !vflip.is_empty() {
-        cmd.arg(vflip);
+
+    if args.vflip == 1 {
+        cmd.arg("--vflip");
     }
-    if !hflip.is_empty() {
-        cmd.arg(hflip);
+    if args.hflip == 1 {
+        cmd.arg("--hflip");
     }
 
-    // Wait for camera warmup
-    thread::sleep(Duration::from_secs(args.timeout));
+    info!("Starting libcamera-vid...");
 
-    // Start the camera process
     let mut child = cmd.spawn()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to start camera: {}", e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to start libcamera-vid: {}", e)))?;
 
-    let mut stdout = child.stdout.take()
+    let mut camera_out = child.stdout.take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to capture stdout"))?;
 
-    // Buffer for reading JPEG data
+    // -----------------------------
+    // Buffering logic
+    // -----------------------------
     let mut buffer = Vec::new();
-    let mut temp_buf = [0u8; 4096];
+    let mut temp = [0u8; 4096];
 
     loop {
-        // Read frame data
-        match stdout.read(&mut temp_buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                buffer.extend_from_slice(&temp_buf[..n]);
-                
-                // Check if we have a complete JPEG (ends with FFD9)
-                if buffer.len() >= 2 && buffer[buffer.len()-2..] == [0xFF, 0xD9] {
-                    // Send frame size as 4-byte little-endian integer
-                    let size = buffer.len() as u32;
-                    stream.write_all(&size.to_le_bytes())?;
-                    stream.flush()?;
-                    
-                    // Send frame data
-                    stream.write_all(&buffer)?;
-                    
-                    // Clear buffer for next frame
-                    buffer.clear();
-                }
-            }
-            Err(e) => return Err(e),
+        let n = camera_out.read(&mut temp)?;
+
+        if n == 0 {
+            break; // camera finished
+        }
+
+        buffer.extend_from_slice(&temp[..n]);
+
+        // JPEG ends with FF D9
+        if buffer.len() >= 2 && buffer[buffer.len() - 2..] == [0xFF, 0xD9] {
+            let size = buffer.len() as u32;
+
+            // Send JPEG length
+            stream.write_all(&size.to_le_bytes())?;
+            // Send JPEG bytes
+            stream.write_all(&buffer)?;
+
+            buffer.clear(); // reset for next frame
         }
     }
 
-    // Send termination signal (size = 0)
+    // End of stream marker
     stream.write_all(&0u32.to_le_bytes())?;
-    
     Ok(())
 }
