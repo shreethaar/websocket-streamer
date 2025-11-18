@@ -69,4 +69,69 @@ fn run_stream(args: &Args) -> io::Result<()> {
     // Connect to server
     let mut stream = TcpStream::connect(format!("{}:{}", args.ip, args.port))?;
     info!("Connected to server successfully.");
-    info
+    info!("Starting broadcast to {}.", args.ip);
+
+    // Build raspistill command for capturing JPEG frames
+    let vflip = if args.vflip == 1 { "-vf" } else { "" };
+    let hflip = if args.hflip == 1 { "-hf" } else { "" };
+    
+    let mut cmd = Command::new("raspistill");
+    cmd.arg("-w").arg(args.width.to_string())
+        .arg("-h").arg(args.height.to_string())
+        .arg("-fps").arg(args.fps.to_string())
+        .arg("-t").arg("0") // Run indefinitely
+        .arg("-o").arg("-") // Output to stdout
+        .arg("-n") // No preview
+        .stdout(Stdio::piped());
+    
+    if !vflip.is_empty() {
+        cmd.arg(vflip);
+    }
+    if !hflip.is_empty() {
+        cmd.arg(hflip);
+    }
+
+    // Wait for camera warmup
+    thread::sleep(Duration::from_secs(args.timeout));
+
+    // Start the camera process
+    let mut child = cmd.spawn()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to start camera: {}", e)))?;
+
+    let mut stdout = child.stdout.take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to capture stdout"))?;
+
+    // Buffer for reading JPEG data
+    let mut buffer = Vec::new();
+    let mut temp_buf = [0u8; 4096];
+
+    loop {
+        // Read frame data
+        match stdout.read(&mut temp_buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                buffer.extend_from_slice(&temp_buf[..n]);
+                
+                // Check if we have a complete JPEG (ends with FFD9)
+                if buffer.len() >= 2 && buffer[buffer.len()-2..] == [0xFF, 0xD9] {
+                    // Send frame size as 4-byte little-endian integer
+                    let size = buffer.len() as u32;
+                    stream.write_all(&size.to_le_bytes())?;
+                    stream.flush()?;
+                    
+                    // Send frame data
+                    stream.write_all(&buffer)?;
+                    
+                    // Clear buffer for next frame
+                    buffer.clear();
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Send termination signal (size = 0)
+    stream.write_all(&0u32.to_le_bytes())?;
+    
+    Ok(())
+}
